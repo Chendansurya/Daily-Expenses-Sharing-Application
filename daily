@@ -1,0 +1,119 @@
+from flask import Flask, request, jsonify, send_file
+from flask_sqlalchemy import SQLAlchemy
+from io import StringIO
+import csv
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///expense_app.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False)
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    mobile_number = db.Column(db.String(20), nullable=False)
+
+class Expense(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    description = db.Column(db.String(100), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    split_type = db.Column(db.String(20), nullable=False)
+    payer_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+class Split(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    expense_id = db.Column(db.Integer, db.ForeignKey('expense.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+
+# Initialize the database
+with app.app_context():
+    db.create_all()
+
+# Helper functions
+def split_equal(expense, participants):
+    share = expense.amount / len(participants)
+    for user_id in participants:
+        split = Split(expense_id=expense.id, user_id=user_id, amount=share)
+        db.session.add(split)
+
+def split_exact(expense, participants):
+    for user_id, amount in participants.items():
+        split = Split(expense_id=expense.id, user_id=user_id, amount=amount)
+        db.session.add(split)
+
+def split_percentage(expense, participants):
+    total_percentage = sum(participants.values())
+    if total_percentage != 100:
+        raise ValueError("Percentages must add up to 100.")
+    for user_id, percentage in participants.items():
+        amount = (percentage / 100) * expense.amount
+        split = Split(expense_id=expense.id, user_id=user_id, amount=amount)
+        db.session.add(split)
+
+# API Endpoints
+
+# Create User
+@app.route('/users', methods=['POST'])
+def create_user():
+    data = request.json
+    user = User(name=data['name'], email=data['email'], mobile_number=data['mobile_number'])
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"message": "User created successfully!"}), 201
+
+# Add Expense
+@app.route('/expenses', methods=['POST'])
+def add_expense():
+    data = request.json
+    expense = Expense(description=data['description'], amount=data['amount'], split_type=data['split_type'], payer_id=data['payer_id'])
+    db.session.add(expense)
+    db.session.commit()
+
+    participants = data['participants']
+    try:
+        if expense.split_type == "equal":
+            split_equal(expense, participants)
+        elif expense.split_type == "exact":
+            split_exact(expense, participants)
+        elif expense.split_type == "percentage":
+            split_percentage(expense, participants)
+        db.session.commit()
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify({"message": "Expense added and split successfully!"}), 201
+
+# Retrieve Individual User Expenses
+@app.route('/users/<int:user_id>/expenses', methods=['GET'])
+def get_user_expenses(user_id):
+    splits = Split.query.filter_by(user_id=user_id).all()
+    result = [{"expense_id": split.expense_id, "amount": split.amount} for split in splits]
+    return jsonify(result)
+
+# Retrieve Overall Expenses
+@app.route('/expenses', methods=['GET'])
+def get_all_expenses():
+    expenses = Expense.query.all()
+    result = [{"description": exp.description, "amount": exp.amount, "split_type": exp.split_type} for exp in expenses]
+    return jsonify(result)
+
+# Download Balance Sheet
+@app.route('/balancesheet/download', methods=['GET'])
+def download_balance_sheet():
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Expense ID', 'User ID', 'Amount'])
+    splits = Split.query.all()
+    for split in splits:
+        writer.writerow([split.expense_id, split.user_id, split.amount])
+
+    output.seek(0)
+    return send_file(BytesIO(output.getvalue().encode()), mimetype='text/csv', as_attachment=True, attachment_filename='balance_sheet.csv')
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
